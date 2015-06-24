@@ -1,0 +1,313 @@
+#!/bin/env python
+#
+
+import datetime
+import optparse
+import ConfigParser
+import os
+import re
+import subprocess
+import sys
+import shutil
+
+# Global vars
+logfileName = '/var/log/rsync-backup'
+debug = None
+sshparam = 'ssh -o Connecttimeout=60 -o PasswordAuthentication=no -o NumberOfPasswordPrompts=0 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null'
+
+
+class logOutput:
+    # Class to manage output to log file.
+    #
+    def __init__(self):
+        # Open logfile (set I/O to be unbeffered)
+        if os.path.exists(logfileName):
+            logfile = open(logfileName, 'ab')
+        else:
+            logfile = open(logfileName, 'wb')
+        # Write to logfile start message
+        logfile.write('\n')
+        logfile.write('Backup ' + str(datetime.datetime.today()) + '\n')
+        logfile.write('=================\n')
+        print('\n')
+        print('Backup ' + str(datetime.datetime.today()) + '\n')
+        print('=================\n')
+        self.logfile = logfile
+    #
+    # Write string and status code to logfile
+    def error(self, output, err):
+        if type(err) == type(0):
+            errStr = 'Error code = %d\n' % err
+        else:
+            errStr = 'Error message = ' + err
+        print('ERROR: ' + output)
+        print('\n')
+        self.logfile.write('ERROR: ' + output)
+        self.logfile.write('\n')
+        print(errStr)
+        print('\n')
+        self.logfile.write(errStr)
+        self.logfile.write('\n')
+    #
+    # Write string to logfile
+    def write(self, output):
+        print(output)
+        print('\n')
+        self.logfile.write(output)
+        self.logfile.write('\n')
+    #
+    # Close logfile
+    def close(self):
+        self.logfile.write('\n')
+        self.logfile.close()
+
+
+class pidFile:
+    # Class to handle creation and removal of pid file.
+    #
+    def __init__(self):
+        self.pid = str(os.getpid())
+        self.name = '/var/run/' + os.path.basename(sys.argv[0]) + '.pid'
+    #
+    def pidIsRunning(self, pid):
+        try:
+            os.kill(pid, 0)
+        except OSError:
+            return
+        else:
+            return pid
+    #
+    def exists(self):
+        if os.path.exists(self.name):
+            otherpid = int(open(self.name).read())
+            if self.pidIsRunning(otherpid):
+                return True
+            else:
+                self.remove()
+                #log.write('WARNING: Stale pid file. Removing')
+        return False
+    #
+    def write(self):
+        f = open(self.name, 'w')
+        f.write(self.pid)
+        f.close()
+    #
+    def remove(self):
+        os.remove(self.name)
+
+
+class backupInfo:
+    def __init__(self, b, log, doDryrun, daysOld, noskip, backupPath):
+        self.server = b['server']
+        self.src = None
+        self.dst = None
+        self.links = None
+        self.exclude = sum(map(lambda i: ['--exclude', i],b['exclude']),[])
+        self.where = b['connection']
+        self.dryrun = ['--dry-run'] if doDryrun == True else None
+        self.log = log
+        self.daysOld = int(daysOld)
+        self.noskip = noskip
+        self.base = backupPath + '/' + b['server']
+        #
+        subdir = '' if os.path.dirname(b['path']) == '/' else os.path.dirname(b['path'])
+        #
+        # Only add user@machine to src is remote ssh
+        if self.where == 'local':
+            self.src = b['path']
+        else:
+            self.src = b['user'] + '@' + b['server'] + ':' + b['path']
+        #
+        # Set destination directory with today's date
+        now = datetime.datetime.now()
+        ds = now.strftime("%Y-%m-%d")
+        self.dst = self.base + '/' + ds + subdir
+        #
+        # Find last backup directory
+        lastDir = ''
+        if os.path.isdir(self.base):
+            files = filter(lambda n: not n == ds, os.listdir(self.base))
+            files = filter(lambda n: not '.' in n, files)
+            files.sort()
+            files.reverse()
+            if len(files) >= 1:
+                self.links = ['--link-dest=' + self.base + '/' + files[0] + subdir]
+    #
+    def makeDst(self):
+        # Create destination directory
+        if not os.path.isdir(self.dst):
+            try:
+                os.makedirs(self.dst)
+            except OSError as e:
+                self.log.error('Creating directory: ' + self.dst, os.strerror(e.errno))
+                sys.exit(-1)
+    #
+    def runBackup(self):
+        # Run the rsync command for a specific backup.
+        # eg: /usr/bin/rsync -avzHWS --link-dest=/backup/chihiro/2014-02-07
+        #                    -e ssh -o ConnectTimeout=60 -o PasswordAuthentication=no -o NumberOfPasswordPrompts=0
+        #                           -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
+        #                    root@kamajii:/etc
+        #                    /backup/kamajii/2014-02-08
+        # 
+        if self.noskip:
+            args = ['-avzHWS']
+            args = self.dryrun + args if self.dryrun else args
+            args = args + self.exclude if self.exclude else args
+            args = args + self.links if self.links else args
+            sshargs = ['-e', sshparam] if self.where == 'ssh' else []
+            cmd = ['/usr/bin/rsync'] + args + sshargs + [self.src, self.dst]
+            self.log.write(' '.join(cmd))
+            # Make sure the destination path exists.
+            self.makeDst()
+            # Run the rsyn command.
+            proc = subprocess.Popen(cmd, stdout = subprocess.PIPE, stderr = subprocess.PIPE)
+            result = proc.communicate()
+            retcode = proc.poll()
+            self.log.write(result[0].rstrip())
+            if retcode:
+                self.log.error(result[1].rstrip(), retcode)
+    #
+    def prune(self):
+        if self.daysOld:
+            # Set destination directory with today's date
+            now = datetime.datetime.now()
+            ds = now.strftime("%Y-%m-%d")
+            #
+            # Find all backup directories
+            if os.path.isdir(self.base):
+                files = filter(lambda n: not n == ds,os.listdir(self.base))
+                files = filter(lambda n: not '.' in n, files)
+                files.sort()
+                files.reverse()
+                if len(files) > self.daysOld:
+                    for directory in files[self.daysOld:]:
+                        p = self.base + '/' + directory
+                        if self.dryrun:
+                            self.log.write('Would remove directory' + p)
+                        else:
+                            self.log.write('Remove directory ' + p)
+                            try:
+                                shutil.rmtree(p)
+                            except ORError as err:
+                                self.log.write(err)
+
+
+def readConfigFile(configName, log):
+    # Read config file and return a list of backups.
+    # Each backup   dict contains:
+    # { name:       Backup name
+    #   machine:    Machine to backup
+    #   user:       User to connect to machine as, default = root
+    #   path:       Directory to backup
+    #   exclude:    Directories to exclude from backup
+    #   connection: type of connection [local | ssh | smb], default = 'ssh'
+    # }
+    #
+    backups = []
+    try:
+        config = ConfigParser.ConfigParser()
+        config.read(configName)
+        for section in config.sections():
+            b = {'name': section, 'exclude': [], 'connection': 'ssh', 'user': 'root'}
+            error = None
+            for item, value in config.items(section):
+                if item == 'server':
+                    b['server'] = value
+                elif item == 'path':
+                    b['path'] = value
+                elif item == 'user':
+                    b['user'] = value
+                elif item == 'connection':
+                    b['connection'] = value
+                elif item == 'exclude':
+                    b['exclude'] = [x.strip() for x in value.split(',')]
+                else:
+                    log.write('Error: Invalid field name "' + item + '" in config file')
+                    error = True
+            if not error:
+                backups.append(b)
+    except ConfigParser.Error as err:
+        log.write(str(err))
+        sys.exit(1)
+    #
+    return backups
+
+
+def doUmount(path, log):
+    #
+    # Umount the backup filesystem.
+    #
+    if os.path.ismount(path):
+        log.write('Unmounting backup disk')
+        retcode = subprocess.call(['/bin/umount', path])
+        if retcode:
+            log.error('Unmount failed', retcode)
+            return False
+    return True
+
+
+def doMount(path, log):
+    #
+    # Mount the backup filesystem if not already mounted,
+    # assumes mount point is defined in fstab.
+    #
+    if not os.path.ismount(path):
+        log.write('Mounting backup disk')
+        retcode = subprocess.call(['/bin/mount', path])
+        if retcode:
+            log.error('Mount failed', retcode)
+            log.close()
+            os.exit(1)
+    else:
+        if doUmount(path, log):
+            doMount(path, log)
+
+
+####################
+#   Manual test commands
+#
+#   log = logOutput()
+#   bc = readConfigFile("/opt/tools/etc/rsync-backup.conf", log)
+#   b = backupInfo(bc[0], log, False, False, False, '/backup')
+
+def main():
+    parser = optparse.OptionParser("usage: %prog [options] ")
+    parser.add_option("-n", "--dry-run", dest="dryrun", default=False, action="store_true", help="Dry run only, don't actually backup anything.")
+    parser.add_option("-f", "--config", dest="configFile", default="/opt/tools/etc/rsync-backup.conf", type="string", help="Use alternative config file.")
+    parser.add_option("-r", "--remove", dest="days", default="31", action="store", type='string', help="Remove backups older than the number of days specified.")
+    parser.add_option("-k", "--skip", dest="noskip", default=True, action="store_false", help="Skip backup (used inconjunction with -r option).")
+    parser.add_option("-m", "--mount", dest="mount", default=False, action="store_true", help="Mounts the backup filesystem prior to backup, and unmounts after completion.")
+    parser.add_option("-p", "--path", dest="backupPath", action="store", help="Specified the backup filesystem mount path, default: /backup.")
+    (options, args) = parser.parse_args()
+    #
+    log = logOutput()
+    pid = pidFile()
+    if options.backupPath:
+        backupPath = options.backupPath
+    else:
+        backupPath = '/backup'
+    #
+    if pid.exists():
+        log.write('Error: PID file exists')
+    else:
+        pid.write()
+        #
+        # Mount backup disk
+        if options.mount:
+            doMount(backupPath, log)
+        #
+        for backup in readConfigFile(options.configFile, log):
+            b = backupInfo(backup, log, options.dryrun, options.days, options.noskip, backupPath)
+            b.runBackup()
+            b.prune()
+        pid.remove()
+    #
+    # Unmount backup disk
+    if options.mount:
+        doUmount(backupPath, log)
+
+    log.close()
+
+if __name__ == "__main__":
+    main()
